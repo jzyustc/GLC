@@ -1,0 +1,17 @@
+*.pyc
+*.pyd
+.vscode/
+.azureml/
+*.bin
+*.png
+*.so
+build/
+build1/
+**/test_room/
+temp.py
+*.pth.tar
+*.onnx
+*.npz
+*.yuv
+
+output/
