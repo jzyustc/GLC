@@ -4,6 +4,7 @@
 import math
 import torch
 from torch import nn
+import torch.nn.functional as F
 from copy import deepcopy
 
 from .common_model import CompressionModel
@@ -49,7 +50,7 @@ class GLC_Decoder(nn.Module):
 
 
 class GLC_Image(CompressionModel):
-    def __init__(self, N=256, anchor_num=4, patch=32, inplace=False):
+    def __init__(self, N=256, patch=32, inplace=False):
         super().__init__()
         self.enc = GLC_Encoder(N, inplace)
         
@@ -86,7 +87,6 @@ class GLC_Image(CompressionModel):
         self.q_dec = nn.Parameter(torch.ones((4, 256, 1, 1)))
 
         self.N = N
-        self.anchor_num = int(anchor_num)
 
         # vqgan part
         self.codebook_size = codebook_size = 16384
@@ -99,13 +99,20 @@ class GLC_Image(CompressionModel):
         # z vq codec part
         self.z_vq = deepcopy(self.vqgan.quantize)
 
-    def get_all_q(self, q_index, batch):
-        curr_q_enc = self.get_curr_q(self.q_enc, q_index, batch)
-        curr_q_dec = self.get_curr_q(self.q_dec, q_index, batch)
-        return curr_q_enc, curr_q_dec
+    @staticmethod
+    def get_qp_num():
+        return 4
+
+    def interpolate_q(self): # To align with video model, interpolate q from num=4 to num=64
+        assert self.q_enc.shape[0] == 4 and self.q_dec.shape[0] == 4
+        interpolated_weights = F.interpolate(self.q_enc.view(1, 1, 4, 256), size=(64, 256), mode='bilinear', align_corners=True)
+        self.q_enc = nn.Parameter(interpolated_weights.view(64, 256, 1, 1))
+        interpolated_weights = F.interpolate(self.q_dec.view(1, 1, 4, 256), size=(64, 256), mode='bilinear', align_corners=True)
+        self.q_dec = nn.Parameter(interpolated_weights.view(64, 256, 1, 1))
 
     def test(self, x, q_index):
-        curr_q_enc, curr_q_dec = self.get_all_q(q_index, 1)
+        curr_q_enc = self.q_enc[q_index:q_index + 1, :, :, :]
+        curr_q_dec = self.q_dec[q_index:q_index + 1, :, :, :]
 
         y_ori = self.vqgan.encoder(x)
         y = self.enc(y_ori, curr_q_enc)
@@ -134,11 +141,13 @@ class GLC_Image(CompressionModel):
             'bit_y': bit_y,
             'bit_z': bit_z,
             'x_hat': x_hat,
+            "ref_latent": y_hat,
         }
         return result
 
     def recon_with_z(self, x, q_index=None):
-        curr_q_enc, curr_q_dec = self.get_all_q(q_index, 1)
+        curr_q_enc = self.q_enc[q_index:q_index + 1, :, :, :]
+        curr_q_dec = self.q_dec[q_index:q_index + 1, :, :, :]
 
         # vqgan encoder
         y_ori = self.vqgan.encoder(x)

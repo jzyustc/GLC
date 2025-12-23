@@ -4,25 +4,7 @@
 import math
 import torch
 from torch import nn
-from torch.autograd import Function
 
-
-class LowerBound(Function):
-    @staticmethod
-    def forward(ctx, inputs, bound):
-        b = torch.ones_like(inputs) * bound
-        ctx.save_for_backward(inputs, b)
-        return torch.max(inputs, b)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        inputs, b = ctx.saved_tensors
-        pass_through_1 = inputs >= b
-        pass_through_2 = grad_output < 0
-
-        pass_through = pass_through_1 | pass_through_2
-        return pass_through.type(grad_output.dtype) * grad_output, None
-    
 
 class CompressionModel(nn.Module):
     def __init__(self):
@@ -30,42 +12,26 @@ class CompressionModel(nn.Module):
         self.masks = {}
         self.force_generate_mask = False
 
-    def quant(self, x, force_detach=False):
-        if self.training or force_detach:
-            n = torch.round(x) - x
-            n = n.clone().detach()
-            return x + n
-
-        return torch.round(x)
-
-    def get_one_q(self, q, q_index):
-        return q[q_index:q_index + 1, :, :, :]
-
-    def get_curr_q(self, q, q_index, batch_size=1):
-        if isinstance(q_index, list):
-            q = [self.get_one_q(q, i) for i in q_index]
-            q = torch.cat(q, dim=0)
-            # print("q_scalce", q)
-            q = q.repeat_interleave(batch_size, dim=0)
-        else:
-            q = self.get_one_q(q, q_index)
-
-        return q
+    def quant(self, x):
+        n = torch.round(x) - x
+        n = n.clone().detach()
+        return x + n
 
     @staticmethod
-    def get_qp_num():
-        return 4
-
-    @staticmethod
-    def get_anchor_num(q_index):
-        if isinstance(q_index, list):
-            return len(q_index)
-        return 1
+    def get_padding_size(height, width, p=64):
+        new_h = (height + p - 1) // p * p
+        new_w = (width + p - 1) // p * p
+        # padding_left = (new_w - width) // 2
+        padding_left = 0
+        padding_right = new_w - width - padding_left
+        # padding_top = (new_h - height) // 2
+        padding_top = 0
+        padding_bottom = new_h - height - padding_top
+        return padding_left, padding_right, padding_top, padding_bottom
 
     def probs_to_bits(self, probs):
         bits = -1.0 * torch.log(probs + 1e-5) / math.log(2.0)
-        bits = LowerBound.apply(bits, 0)
-        return bits
+        return bits.clamp_min(0)
 
     def get_y_gaussian_bits(self, y, sigma):
         mu = torch.zeros_like(sigma)
@@ -74,9 +40,25 @@ class CompressionModel(nn.Module):
         probs = gaussian.cdf(y + 0.5) - gaussian.cdf(y - 0.5)
         return self.probs_to_bits(probs)
 
-    @staticmethod
-    def separate_prior(params):
-        return params.chunk(3, 1)
+    def pad_for_y(self, y):
+        _, _, H, W = y.size()
+        padding_l, padding_r, padding_t, padding_b = self.get_padding_size(H, W, 4)
+        y_pad = torch.nn.functional.pad(
+            y,
+            (padding_l, padding_r, padding_t, padding_b),
+            mode="replicate",
+        )
+        return y_pad, (-padding_l, -padding_r, -padding_t, -padding_b)
+
+    def slice_to_y(self, param, slice_shape):
+        return torch.nn.functional.pad(param, slice_shape)
+
+    def separate_prior(self, params):
+        quant_step, scales, means = params.chunk(3, 1)
+        quant_step = quant_step.clamp_min(0.5)
+        q_enc = 1. / quant_step
+        q_dec = quant_step
+        return q_enc, q_dec, scales, means
 
     def get_mask(self, height, width, dtype, device):
         curr_mask_str = f"{width}x{height}"
@@ -98,6 +80,56 @@ class CompressionModel(nn.Module):
         y_q = self.quant(y_res)
         y_hat = y_q + means_hat
 
+        return y_res, y_q, y_hat, scales_hat
+
+    @staticmethod
+    def get_one_channel_dual_mask(height, width, dtype, device):
+        micro_mask_0 = torch.tensor(((1, 0), (0, 1)), dtype=dtype, device=device)
+        mask_0 = micro_mask_0.repeat((height + 1) // 2, (width + 1) // 2)
+        mask_0 = mask_0[:height, :width]
+        mask_0 = torch.unsqueeze(mask_0, 0)
+        mask_0 = torch.unsqueeze(mask_0, 0)
+
+        micro_mask_1 = torch.tensor(((0, 1), (1, 0)), dtype=dtype, device=device)
+        mask_1 = micro_mask_1.repeat((height + 1) // 2, (width + 1) // 2)
+        mask_1 = mask_1[:height, :width]
+        mask_1 = torch.unsqueeze(mask_1, 0)
+        mask_1 = torch.unsqueeze(mask_1, 0)
+
+        return mask_0, mask_1
+
+    def get_mask_dual(self, batch, channel, height, width, dtype, device):
+        curr_mask_str = f"{batch}_{channel}x{width}x{height}"
+        with torch.no_grad():
+            if curr_mask_str not in self.masks or self.force_generate_mask:
+                assert channel % 2 == 0
+                m = torch.ones((batch, channel // 2, height, width), dtype=dtype, device=device)
+                m0, m1 = self.get_one_channel_dual_mask(height, width, dtype, device)
+
+                mask_0 = torch.cat((m * m0, m * m1), dim=1)
+                mask_1 = torch.cat((m * m1, m * m0), dim=1)
+
+                self.masks[curr_mask_str] = [mask_0, mask_1]
+        return self.masks[curr_mask_str]
+
+    def forward_dual_prior(self, y, common_params, y_spatial_prior):
+        q_enc, q_dec, scales, means = self.separate_prior(common_params)
+        dtype = y.dtype
+        device = y.device
+        B, C, H, W = y.size()
+        mask_0, mask_1 = self.get_mask_dual(B, C, H, W, dtype, device)
+
+        y = y * q_enc
+        y_res_0, y_q_0, y_hat_0, s_hat_0 = self.process_with_mask(y, scales, means, mask_0)
+        scales, means = y_spatial_prior(torch.cat((y_hat_0, common_params), dim=1)).chunk(2, 1)
+        y_res_1, y_q_1, y_hat_1, s_hat_1 = self.process_with_mask(y, scales, means, mask_1)
+
+        y_hat = y_hat_0 + y_hat_1
+        y_hat = y_hat * q_dec
+
+        y_res = y_res_0 + y_res_1
+        y_q = y_q_0 + y_q_1
+        scales_hat = s_hat_0 + s_hat_1
         return y_res, y_q, y_hat, scales_hat
 
     @staticmethod
@@ -158,7 +190,7 @@ class CompressionModel(nn.Module):
         y_?_2, means multiply with mask_2
         y_?_3, means multiply with mask_3
         '''
-        quant_step, scales, means = self.separate_prior(common_params)
+        q_enc, q_dec, scales, means = self.separate_prior(common_params)
         if y_spatial_prior_reduction is not None:
             common_params = y_spatial_prior_reduction(common_params)
         dtype = y.dtype
@@ -166,11 +198,7 @@ class CompressionModel(nn.Module):
         B, C, H, W = y.size()
         mask_0, mask_1, mask_2, mask_3 = self.get_mask_four_parts(B, C, H, W, dtype, device)
 
-        if self.training:
-            quant_step = LowerBound.apply(quant_step, 0.5)
-        else:
-            quant_step = torch.clamp_min(quant_step, 0.5)
-        y = y / quant_step
+        y = y * q_enc
 
         y_res_0, y_q_0, y_hat_0, s_hat_0 = self.process_with_mask(y, scales, means, mask_0)
 
@@ -194,7 +222,7 @@ class CompressionModel(nn.Module):
         y_hat = y_hat_so_far + y_hat_3
         scales_hat = (s_hat_0 + s_hat_1) + (s_hat_2 + s_hat_3)
 
-        y_hat = y_hat * quant_step
+        y_hat = y_hat * q_dec
 
         return y_res, y_q, y_hat, scales_hat
 
@@ -222,10 +250,7 @@ class CompressionModel(nn.Module):
         y_?_2, means multiply with mask_2
         y_?_3, means multiply with mask_3
         '''
-        quant_step, scales, means = self.separate_prior(common_params)
-        # print("q", quant_step.abs().max(), quant_step.abs().mean())
-        # print("scale", scales.abs().max(), scales.abs().mean())
-        # print("means", means.abs().max(), means.abs().mean())
+        q_enc, q_dec, scales, means = self.separate_prior(common_params)
         if y_spatial_prior_reduction is not None:
             common_params = y_spatial_prior_reduction(common_params)
         dtype = y.dtype
@@ -233,11 +258,7 @@ class CompressionModel(nn.Module):
         B, C, H, W = y.size()
         mask_0, mask_1, mask_2, mask_3 = self.get_mask_four_parts(B, C, H, W, dtype, device)
 
-        if self.training:
-            quant_step = LowerBound.apply(quant_step, 0.5)
-        else:
-            quant_step = torch.clamp_min(quant_step, 0.5)
-        y = y / quant_step
+        y = y * q_enc
 
         y_hat_0, m_hat_0 = self.process_with_mask_recon_with_z(y, scales, means, mask_0)
 
@@ -259,6 +280,6 @@ class CompressionModel(nn.Module):
         y_hat = y_hat_so_far + y_hat_3
         # y_hat = m_hat_0 + m_hat_1 + m_hat_2 + m_hat_3
 
-        y_hat = y_hat * quant_step
+        y_hat = y_hat * q_dec
 
         return  y_hat
