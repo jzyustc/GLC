@@ -5,7 +5,9 @@
 </div>
 
 [![CVPR 2024](https://img.shields.io/badge/CVPR%202024-Paper-blue?logo=readthedocs&logoColor=white)](https://openaccess.thecvf.com/content/CVPR2024/papers/Jia_Generative_Latent_Coding_for_Ultra-Low_Bitrate_Image_Compression_CVPR_2024_paper.pdf)
+[![arXiv](https://img.shields.io/badge/arXiv-2512.20194-b31b1b?logo=arxiv)](https://arxiv.org/abs/2512.20194)
 [![TCSVT](https://img.shields.io/badge/TCSVT-Paper-green?logo=ieee)](https://ieeexplore.ieee.org/document/11007732)
+[![arXiv](https://img.shields.io/badge/arXiv-2505.16177-b31b1b?logo=arxiv)](https://arxiv.org/abs/2505.16177)
 
 
 Official Implementation of GLC, Generative Latent Coding for Ultra-Low Bitrate Image Compression, accepted at CVPR 2024, with an extension to video compression in TCSVT.
